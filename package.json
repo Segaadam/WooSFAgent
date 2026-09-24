@@ -1,0 +1,11 @@
+{
+  "name": "bfa-salesforce-sync",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hourly sync of BFA WooCommerce orders to Salesforce Contacts and Assets",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "sync": "node sync.js",
+    "dry-run": "DRY_RUN=true node sync.js"
+  }
+}
