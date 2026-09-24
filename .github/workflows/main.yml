@@ -5,7 +5,7 @@
 const fs = require('fs');
 function clean(s) 
 const CONFIG = {
-  productIds: [2139, 2140, 2141], // BFA packages
+  productIds: [2139, 2140, 2141], // BFA packages]
   statuses: ['processing', 'completed'],
   lookbackDays: Number(process.env.LOOKBACK_DAYS || 3),
   maxAttempts: 3, // after this many failures an order is parked for manual review
