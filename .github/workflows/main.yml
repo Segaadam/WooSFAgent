@@ -42,3 +42,4 @@ jobs:
           SF_CFP_FIELD: ${{ vars.SF_CFP_FIELD }}
           LOOKBACK_DAYS: ${{ inputs.lookback_days || '3' }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+productCodeOverrides: { 2139: 'BFA-SD', 2140: 'BFA-SUP', 2141: 'BFA-STR' },
