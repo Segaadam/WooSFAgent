@@ -11,8 +11,7 @@ function clean(s) {
 
 // ============================================================================
 // PRODUCT MAP: the ONLY WooCommerce products this sync will ever touch.
-// Left:  WooCommerce product ID.
-// Right: the exact name of the matching product in Salesforce (Products tab).
+// Left:  WooCommerce product ID.   Right: package name (kept on the Asset).
 // Any product not listed here is ignored, even if it's in the same order.
 // ============================================================================
 const PRODUCT_MAP = {
@@ -20,6 +19,10 @@ const PRODUCT_MAP = {
   2140: 'BFA- Supported Package',
   2141: 'BFA- Structured Package',
 };
+
+// Every package above becomes an Asset of this one Salesforce product.
+const SF_PRODUCT_CODE = 'BFA';
+const SF_ASSET_NAME = 'Behavioral Financial Advice';
 
 const CONFIG = {
   productIds: Object.keys(PRODUCT_MAP).map(Number),
@@ -223,9 +226,11 @@ async function resolveAccount(person, existingContact) {
   if (existingContact && existingContact.AccountId) return existingContact.AccountId;
 
   if (person.company) {
-    const found = await query(`SELECT Id FROM Account WHERE Name = '${soqlEscape(person.company)}' LIMIT 2`);
-    if (found.length === 1) return found[0].Id;
-    if (found.length > 1) throw new Error(`More than one Account named "${person.company}"; link this one manually`);
+    // If several Accounts share the name, use the oldest one.
+    const found = await query(
+      `SELECT Id FROM Account WHERE Name = '${soqlEscape(person.company)}' ORDER BY CreatedDate ASC LIMIT 1`
+    );
+    if (found.length) return found[0].Id;
   }
 
   // No company (or company not found): create a new Account.
@@ -276,22 +281,22 @@ async function upsertContact(person) {
 
 const WARNINGS = [];
 
-// Finds the Salesforce product for a line item using PRODUCT_MAP (by exact name).
-// Returns null if there's no match, so the Asset is still created and a warning is shown.
-async function findProduct(item) {
-  const sfName = PRODUCT_MAP[item.product_id];
-  const found = await query(
-    `SELECT Id FROM Product2 WHERE Name = '${soqlEscape(sfName)}' AND IsActive = true LIMIT 2`
-  );
-  if (found.length === 1) return found[0].Id;
-
-  const msg =
-    found.length > 1
-      ? `More than one active Salesforce product named "${sfName}"; Asset created without a product link`
-      : `No active Salesforce product named "${sfName}"; Asset created without a product link`;
-  console.log(`::warning::${msg}`);
-  WARNINGS.push(msg);
-  return null;
+// Finds the single Salesforce product (Product Code SF_PRODUCT_CODE) once per run.
+// Returns null if it's missing, so Assets are still created and a warning is shown.
+let productLookup = null;
+function findProduct() {
+  if (!productLookup) {
+    productLookup = query(
+      `SELECT Id FROM Product2 WHERE ProductCode = '${soqlEscape(SF_PRODUCT_CODE)}' AND IsActive = true ORDER BY CreatedDate ASC LIMIT 1`
+    ).then((found) => {
+      if (found.length) return found[0].Id;
+      const msg = `No active Salesforce product with Product Code "${SF_PRODUCT_CODE}"; Assets created without a product link`;
+      console.log(`::warning::${msg}`);
+      WARNINGS.push(msg);
+      return null;
+    });
+  }
+  return productLookup;
 }
 
 async function createAsset(order, item, contactId, accountId) {
@@ -302,9 +307,9 @@ async function createAsset(order, item, contactId, accountId) {
     console.log(`   Asset already exists for ${ref} (${dup[0].Id})`);
     return dup[0].Id;
   }
-  const product2Id = await findProduct(item);
+  const product2Id = await findProduct();
   const id = await sfCreate('Asset', {
-    Name: item.name,
+    Name: SF_ASSET_NAME,
     AccountId: accountId,
     ContactId: contactId,
     ...(product2Id ? { Product2Id: product2Id } : {}),
@@ -313,9 +318,9 @@ async function createAsset(order, item, contactId, accountId) {
     PurchaseDate: String(order.date_created).slice(0, 10),
     Quantity: item.quantity,
     Price: Number(item.price) || null,
-    Description: `WooCommerce order #${order.number}`,
+    Description: `${PRODUCT_MAP[item.product_id]} (WooCommerce order #${order.number})`,
   });
-  console.log(`   Created Asset ${id} for "${item.name}"`);
+  console.log(`   Created Asset ${id} for "${PRODUCT_MAP[item.product_id]}"`);
   return id;
 }
 
