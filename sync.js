@@ -9,8 +9,20 @@ function clean(s) {
   return s == null ? '' : String(s).trim();
 }
 
+// ============================================================================
+// PRODUCT MAP: the ONLY WooCommerce products this sync will ever touch.
+// Left:  WooCommerce product ID.
+// Right: the exact name of the matching product in Salesforce (Products tab).
+// Any product not listed here is ignored, even if it's in the same order.
+// ============================================================================
+const PRODUCT_MAP = {
+  2139: 'BFA- Self-Directed Package',
+  2140: 'BFA- Supported Package',
+  2141: 'BFA- Structured Package',
+};
+
 const CONFIG = {
-  productIds: [2139, 2140, 2141], // BFA packages
+  productIds: Object.keys(PRODUCT_MAP).map(Number),
   statuses: ['processing', 'completed'],
   lookbackDays: Number(process.env.LOOKBACK_DAYS || 3),
   maxAttempts: 3, // after this many failures an order is parked for manual review
@@ -20,9 +32,6 @@ const CONFIG = {
   sfCfpField: clean(process.env.SF_CFP_FIELD), // Contact API field for CFP ID, e.g. CFP_ID__c
   sfApiVersion: 'v61.0',
   dryRun: process.env.DRY_RUN === 'true',
-  // Only needed if a WooCommerce SKU doesn't match the Salesforce Product2 ProductCode.
-  // Example: { 2139: 'BFA-SD' }
-  productCodeOverrides: {},
 };
 
 // ---------- helpers ----------
@@ -265,14 +274,24 @@ async function upsertContact(person) {
   return { contactId, accountId };
 }
 
+const WARNINGS = [];
+
+// Finds the Salesforce product for a line item using PRODUCT_MAP (by exact name).
+// Returns null if there's no match, so the Asset is still created and a warning is shown.
 async function findProduct(item) {
-  const code = CONFIG.productCodeOverrides[item.product_id] || clean(item.sku);
-  if (!code) throw new Error(`Line item "${item.name}" has no SKU and no override code`);
+  const sfName = PRODUCT_MAP[item.product_id];
   const found = await query(
-    `SELECT Id FROM Product2 WHERE ProductCode = '${soqlEscape(code)}' AND IsActive = true LIMIT 2`
+    `SELECT Id FROM Product2 WHERE Name = '${soqlEscape(sfName)}' AND IsActive = true LIMIT 2`
   );
-  if (found.length !== 1) throw new Error(`Expected 1 active Salesforce product with code "${code}", found ${found.length}`);
-  return found[0].Id;
+  if (found.length === 1) return found[0].Id;
+
+  const msg =
+    found.length > 1
+      ? `More than one active Salesforce product named "${sfName}"; Asset created without a product link`
+      : `No active Salesforce product named "${sfName}"; Asset created without a product link`;
+  console.log(`::warning::${msg}`);
+  WARNINGS.push(msg);
+  return null;
 }
 
 async function createAsset(order, item, contactId, accountId) {
@@ -288,7 +307,7 @@ async function createAsset(order, item, contactId, accountId) {
     Name: item.name,
     AccountId: accountId,
     ContactId: contactId,
-    Product2Id: product2Id,
+    ...(product2Id ? { Product2Id: product2Id } : {}),
     SerialNumber: ref,
     Status: 'Purchased',
     PurchaseDate: String(order.date_created).slice(0, 10),
@@ -384,6 +403,7 @@ async function main() {
     ...(successes.length ? ['', '### Synced', ...successes.map((s) => `- ${s}`)] : []),
     ...(failures.length ? ['', '### Failed (will retry)', ...failures.map((s) => `- ${s}`)] : []),
     ...(parked.length ? ['', '### Needs manual attention', ...parked.map((o) => `- #${o.number}`)] : []),
+    ...(WARNINGS.length ? ['', '### Warnings', ...[...new Set(WARNINGS)].map((w) => `- ${w}`)] : []),
   ]);
 
   if (failures.length) process.exit(1); // marks the run red so GitHub emails you
