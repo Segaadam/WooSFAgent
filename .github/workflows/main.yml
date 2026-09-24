@@ -1,0 +1,44 @@
+name: BFA → Salesforce sync
+
+on:
+  schedule:
+    # Every hour at :07 (off the top of the hour, when GitHub's scheduler is busiest).
+    - cron: '7 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview only (write nothing to Salesforce or WooCommerce)'
+        type: boolean
+        default: true
+      lookback_days:
+        description: 'How many days of orders to check'
+        type: string
+        default: '3'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bfa-salesforce-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run sync
+        run: node sync.js
+        env:
+          WC_STORE_URL: ${{ secrets.WC_STORE_URL }}
+          WC_CONSUMER_KEY: ${{ secrets.WC_CONSUMER_KEY }}
+          WC_CONSUMER_SECRET: ${{ secrets.WC_CONSUMER_SECRET }}
+          SF_AUTH_URL: ${{ secrets.SF_AUTH_URL }}
+          CFP_META_KEY: ${{ vars.CFP_META_KEY }}
+          SF_CFP_FIELD: ${{ vars.SF_CFP_FIELD }}
+          LOOKBACK_DAYS: ${{ inputs.lookback_days || '3' }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
