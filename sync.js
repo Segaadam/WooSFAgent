@@ -158,7 +158,11 @@ async function sfLogin() {
     );
   }
   const j = await res.json();
-  SF = { base: `${j.instance_url}/services/data/${CONFIG.sfApiVersion}`, token: j.access_token };
+  SF = {
+    base: `${j.instance_url}/services/data/${CONFIG.sfApiVersion}`,
+    soapUrl: `${j.instance_url}/services/Soap/u/${CONFIG.sfApiVersion.replace('v', '')}`,
+    token: j.access_token,
+  };
 }
 
 async function sf(path, opts = {}) {
@@ -248,13 +252,64 @@ async function resolveAccount(person, existingContact) {
   );
 }
 
-async function upsertContact(person) {
-  const matches = await query(
-    `SELECT Id, AccountId FROM Contact WHERE Email = '${soqlEscape(person.email)}' ORDER BY CreatedDate ASC LIMIT 5`
+// ---------- Lead conversion ----------
+async function findOpenLead(email) {
+  const leads = await query(
+    `SELECT Id FROM Lead WHERE Email = '${soqlEscape(email)}' AND IsConverted = false ORDER BY CreatedDate ASC LIMIT 1`
   );
-  if (matches.length > 1) console.log(`   Note: ${matches.length} Contacts share ${person.email}; using the oldest`);
-  const existing = matches[0] || null;
+  return leads[0] || null;
+}
 
+let convertedStatus = null;
+async function getConvertedStatus() {
+  if (!convertedStatus) {
+    const found = await query('SELECT MasterLabel FROM LeadStatus WHERE IsConverted = true ORDER BY SortOrder LIMIT 1');
+    if (!found.length) throw new Error('Salesforce has no "converted" Lead Status set up');
+    convertedStatus = found[0].MasterLabel;
+  }
+  return convertedStatus;
+}
+
+const xmlEscape = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+// Converts a Lead into a Contact (and Account) with no Opportunity.
+// Salesforce only offers lead conversion through its SOAP API, so this call uses SOAP.
+async function convertLead(leadId, accountId) {
+  const status = await getConvertedStatus();
+  if (CONFIG.dryRun) {
+    console.log(`   [dry run] would convert Lead ${leadId}${accountId ? ` into Account ${accountId}` : ''}`);
+    return { contactId: 'DRYRUN-Contact', accountId: accountId || 'DRYRUN-Account' };
+  }
+  const body =
+    '<?xml version="1.0" encoding="utf-8"?>' +
+    '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:partner.soap.sforce.com">' +
+    `<soapenv:Header><urn:SessionHeader><urn:sessionId>${xmlEscape(SF.token)}</urn:sessionId></urn:SessionHeader></soapenv:Header>` +
+    '<soapenv:Body><urn:convertLead><urn:leadConverts>' +
+    (accountId ? `<urn:accountId>${accountId}</urn:accountId>` : '') +
+    `<urn:convertedStatus>${xmlEscape(status)}</urn:convertedStatus>` +
+    '<urn:doNotCreateOpportunity>true</urn:doNotCreateOpportunity>' +
+    `<urn:leadId>${leadId}</urn:leadId>` +
+    '<urn:overwriteLeadSource>false</urn:overwriteLeadSource>' +
+    '<urn:sendNotificationEmail>false</urn:sendNotificationEmail>' +
+    '</urn:leadConverts></urn:convertLead></soapenv:Body></soapenv:Envelope>';
+  const res = await request('Salesforce convertLead', SF.soapUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/xml; charset=utf-8', SOAPAction: '""' },
+    body,
+  });
+  const xml = await res.text();
+  const tag = (t) => (xml.match(new RegExp(`<(?:\\w+:)?${t}>([^<]*)</(?:\\w+:)?${t}>`)) || [])[1];
+  if (!res.ok || tag('success') !== 'true') {
+    throw new Error(`Lead ${leadId} could not be converted: ${tag('message') || tag('faultstring') || `HTTP ${res.status}`}`);
+  }
+  return { contactId: tag('contactId'), accountId: tag('accountId') };
+}
+
+// ---------- person -> Contact ----------
+// 1. Existing Contact with this email: update it.
+// 2. Otherwise, an open Lead with this email: convert it, then update the new Contact.
+// 3. Otherwise: create a new Contact.
+async function upsertContact(person) {
   const fields = compact({
     FirstName: person.firstName,
     LastName: person.lastName,
@@ -267,16 +322,34 @@ async function upsertContact(person) {
     ...(CONFIG.sfCfpField && person.cfpId ? { [CONFIG.sfCfpField]: person.cfpId } : {}),
   });
 
-  const accountId = await resolveAccount(person, existing);
+  const matches = await query(
+    `SELECT Id, AccountId FROM Contact WHERE Email = '${soqlEscape(person.email)}' ORDER BY CreatedDate ASC LIMIT 5`
+  );
+  if (matches.length > 1) console.log(`   Note: ${matches.length} Contacts share ${person.email}; using the oldest`);
+  const existing = matches[0] || null;
 
   if (existing) {
-    await sfUpdate('Contact', existing.Id, fields);
-    console.log(`   Updated Contact ${existing.Id}`);
-    return { contactId: existing.Id, accountId };
+    const accountId = await resolveAccount(person, existing);
+    await sfUpdate('Contact', existing.Id, existing.AccountId ? fields : { ...fields, AccountId: accountId });
+    console.log(`   Updated existing Contact ${existing.Id}`);
+    return { contactId: existing.Id, accountId, how: 'existing Contact' };
   }
+
+  const lead = await findOpenLead(person.email);
+  if (lead) {
+    // With a company on the order, convert into the matching (oldest) Account;
+    // otherwise Salesforce creates the Account from the Lead's company.
+    const targetAccount = person.company ? await resolveAccount(person, null) : null;
+    const converted = await convertLead(lead.Id, targetAccount);
+    console.log(`   Converted Lead ${lead.Id} to Contact ${converted.contactId}`);
+    await sfUpdate('Contact', converted.contactId, fields);
+    return { ...converted, how: 'converted from Lead' };
+  }
+
+  const accountId = await resolveAccount(person, null);
   const contactId = await sfCreate('Contact', { ...fields, AccountId: accountId });
   console.log(`   Created Contact ${contactId}`);
-  return { contactId, accountId };
+  return { contactId, accountId, how: 'new Contact' };
 }
 
 const WARNINGS = [];
@@ -330,13 +403,13 @@ async function processOrder(order) {
   if (!person.email) throw new Error('Order has no billing email');
   if (!person.lastName) throw new Error('Order has no billing last name');
 
-  const { contactId, accountId } = await upsertContact(person);
+  const { contactId, accountId, how } = await upsertContact(person);
 
   const items = order.line_items.filter((li) => CONFIG.productIds.includes(li.product_id));
   const assetIds = [];
   for (const item of items) assetIds.push(await createAsset(order, item, contactId, accountId));
 
-  const summary = `Contact ${contactId}; Assets ${assetIds.join(', ')}`;
+  const summary = `Contact ${contactId} (${how}); Assets ${assetIds.join(', ')}`;
   await setOrderMeta(order.id, CONFIG.stampKey, `${summary} on ${today()}`);
   await addOrderNote(order.id, `Synced to Salesforce. ${summary}.`);
   return summary;
