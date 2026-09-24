@@ -2,8 +2,13 @@
 // Finds WooCommerce orders for the BFA packages, creates/updates the buyer as a
 // Salesforce Contact (under an Account), and creates one Asset per BFA line item.
 // Runs hourly on GitHub Actions. No npm dependencies (uses Node's built-in fetch).
+
 const fs = require('fs');
-function clean(s) 
+
+function clean(s) {
+  return s == null ? '' : String(s).trim();
+}
+
 const CONFIG = {
   productIds: [2139, 2140, 2141], // BFA packages
   statuses: ['processing', 'completed'],
