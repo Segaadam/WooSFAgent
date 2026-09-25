@@ -40,6 +40,9 @@ const CONFIG = {
   sfCfpField: clean(process.env.SF_CFP_FIELD), // Contact API field for CFP ID, e.g. CFP_ID__c
   sfApiVersion: 'v61.0',
   dryRun: process.env.DRY_RUN === 'true',
+  // Catch-up mode: re-run orders that were ALREADY synced (fills in anything missing,
+  // e.g. Opportunities). Existing Contacts, Assets and Opportunities are detected and skipped.
+  resyncSynced: process.env.RESYNC_SYNCED === 'true',
 };
 
 // ---------- helpers ----------
@@ -511,7 +514,10 @@ async function main() {
   const bfaOrders = orders.filter((o) => o.line_items.some((li) => CONFIG.productIds.includes(li.product_id)));
   const unsynced = bfaOrders.filter((o) => !metaValue(o, CONFIG.stampKey));
   const parked = unsynced.filter((o) => (Number(metaValue(o, CONFIG.attemptsKey)) || 0) >= CONFIG.maxAttempts);
-  const todo = unsynced.filter((o) => !parked.includes(o));
+  const todo = CONFIG.resyncSynced
+    ? bfaOrders.filter((o) => metaValue(o, CONFIG.stampKey))
+    : unsynced.filter((o) => !parked.includes(o));
+  if (CONFIG.resyncSynced) console.log('CATCH-UP MODE: re-running orders that were already synced');
 
   console.log(
     `Orders in last ${CONFIG.lookbackDays} days: ${orders.length} | BFA: ${bfaOrders.length} | ` +
