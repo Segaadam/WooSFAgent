@@ -13,6 +13,10 @@ on:
         description: 'How many days of orders to check'
         type: string
         default: '3'
+      resync_synced:
+        description: 'Catch-up: re-run orders that were already synced (fills in missing records)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -41,3 +45,4 @@ jobs:
           SF_CFP_FIELD: ${{ vars.SF_CFP_FIELD }}
           LOOKBACK_DAYS: ${{ inputs.lookback_days || '3' }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          RESYNC_SYNCED: ${{ github.event_name == 'workflow_dispatch' && inputs.resync_synced || 'false' }}
