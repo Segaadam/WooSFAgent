@@ -24,6 +24,11 @@ const PRODUCT_MAP = {
 const SF_PRODUCT_CODE = 'BFA';
 const SF_ASSET_NAME = 'Behavioral Financial Advice';
 
+// Each order also gets one Opportunity with these settings.
+const SF_OPP_STAGE = 'Closed Won';
+const SF_OPP_WORK = 'Product'; // Work being conducted (Work_being_conducted__c)
+const SF_OPP_RECORD_TYPE = 'Team_BFA'; // Record type API name
+
 const CONFIG = {
   productIds: Object.keys(PRODUCT_MAP).map(Number),
   statuses: ['processing', 'completed'],
@@ -397,6 +402,62 @@ async function createAsset(order, item, contactId, accountId) {
   return id;
 }
 
+// ---------- Opportunity ----------
+let oppRecordTypeLookup = null;
+function getOppRecordTypeId() {
+  if (!oppRecordTypeLookup) {
+    oppRecordTypeLookup = query(
+      `SELECT Id FROM RecordType WHERE SobjectType = 'Opportunity' AND DeveloperName = '${soqlEscape(SF_OPP_RECORD_TYPE)}' AND IsActive = true LIMIT 1`
+    ).then((found) => {
+      if (found.length) return found[0].Id;
+      const msg = `Opportunity record type "${SF_OPP_RECORD_TYPE}" not found; Opportunities use the default record type`;
+      console.log(`::warning::${msg}`);
+      WARNINGS.push(msg);
+      return null;
+    });
+  }
+  return oppRecordTypeLookup;
+}
+
+// One Opportunity per order: "Shipping company - First Last - Product".
+async function createOpportunity(order, person, items, contactId, accountId) {
+  const company = clean(order.shipping && order.shipping.company) || person.company;
+  const products = [...new Set(items.map((i) => PRODUCT_MAP[i.product_id]))].join(', ');
+  const name = [company, `${person.firstName} ${person.lastName}`.trim(), products]
+    .filter(Boolean)
+    .join(' - ')
+    .slice(0, 120);
+  const closeDate = String(order.date_paid || order.date_created).slice(0, 10);
+  const amount = Number(order.total) || 0;
+
+  // Skip if this Opportunity already exists (e.g. a re-run of the same order).
+  if (!String(accountId).startsWith('DRYRUN')) {
+    const dup = await query(
+      `SELECT Id FROM Opportunity WHERE Name = '${soqlEscape(name)}' AND AccountId = '${soqlEscape(accountId)}' ` +
+        `AND CloseDate = ${closeDate} AND Amount = ${amount} LIMIT 1`
+    );
+    if (dup.length) {
+      console.log(`   Opportunity already exists (${dup[0].Id})`);
+      return dup[0].Id;
+    }
+  }
+
+  const recordTypeId = await getOppRecordTypeId();
+  const id = await sfCreate('Opportunity', {
+    Name: name,
+    AccountId: accountId,
+    Contact__c: contactId,
+    CloseDate: closeDate,
+    Amount: amount,
+    StageName: SF_OPP_STAGE,
+    Work_being_conducted__c: SF_OPP_WORK,
+    ...(recordTypeId ? { RecordTypeId: recordTypeId } : {}),
+    Description: `WooCommerce order #${order.number}`,
+  });
+  console.log(`   Created Opportunity ${id}: "${name}"`);
+  return id;
+}
+
 // ---------- per-order flow ----------
 async function processOrder(order) {
   const person = getPerson(order);
@@ -409,7 +470,9 @@ async function processOrder(order) {
   const assetIds = [];
   for (const item of items) assetIds.push(await createAsset(order, item, contactId, accountId));
 
-  const summary = `Contact ${contactId} (${how}); Assets ${assetIds.join(', ')}`;
+  const oppId = await createOpportunity(order, person, items, contactId, accountId);
+
+  const summary = `Contact ${contactId} (${how}); Assets ${assetIds.join(', ')}; Opportunity ${oppId}`;
   await setOrderMeta(order.id, CONFIG.stampKey, `${summary} on ${today()}`);
   await addOrderNote(order.id, `Synced to Salesforce. ${summary}.`);
   return summary;
