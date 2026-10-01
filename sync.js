@@ -32,6 +32,8 @@ const SF_OPP_RECORD_TYPE = 'Team_BFA'; // Record type API name
 // Email domains that always go under one Account, whatever company name the buyer typed.
 const DOMAIN_ACCOUNTS = {
   'ampf.com': 'Ameriprise Financial',
+  'lpl.com': 'LPL',
+  'thrivent.com': 'Thrivent',
 };
 
 const CONFIG = {
