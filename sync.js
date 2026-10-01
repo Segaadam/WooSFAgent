@@ -1,6 +1,8 @@
-// BFA → Salesforce sync
-// Finds WooCommerce orders for the BFA packages, creates/updates the buyer as a
-// Salesforce Contact (under an Account), and creates one Asset per BFA line item.
+// WooCommerce → Salesforce sync
+// Finds WooCommerce orders for the products in one sync profile (BFA or Store),
+// creates/updates the buyer as a Salesforce Contact (under an Account), creates one
+// Asset per line item and one Opportunity per order.
+// Run with: node sync.js bfa   or   node sync.js store
 // Runs hourly on GitHub Actions. No npm dependencies (uses Node's built-in fetch).
 
 const fs = require('fs');
@@ -10,23 +12,78 @@ function clean(s) {
 }
 
 // ============================================================================
-// PRODUCT MAP: the ONLY WooCommerce products this sync will ever touch.
-// Left:  WooCommerce product ID.   Right: package name (kept on the Asset).
-// Any product not listed here is ignored, even if it's in the same order.
+// SYNC PROFILES: the ONLY WooCommerce products this sync will ever touch.
+// Each profile keeps its own order stamp, so an order containing products from
+// both profiles is synced once by each, into its own Opportunity.
+//
+// For each WooCommerce product ID:
+//   name  : product name, used in the Opportunity name and Asset description
+//   code  : Salesforce Product2 Product Code (Store products default to their ID)
+//   asset : Asset name (blank = the Salesforce product's name)
+//   work  : Work being conducted on the Opportunity. One of:
+//           Consulting, Coaching, Training, Keynote, Product, License
+// Any product not listed in the profile is ignored, even if it's in the same order.
 // ============================================================================
-const PRODUCT_MAP = {
-  2139: 'BFA- Self-Directed Package',
-  2140: 'BFA- Supported Package',
-  2141: 'BFA- Structured Package',
+
+// Every BFA package becomes an Asset of this one Salesforce product.
+const BFA_PACKAGE = { code: 'BFA', asset: 'Behavioral Financial Advice', work: 'Product' };
+
+const PROFILES = {
+  bfa: {
+    label: 'BFA',
+    stampKey: 'sf_asset_created', // order custom field: set when an order has synced
+    attemptsKey: 'sf_sync_attempts', // order custom field: failed attempt count
+    products: {
+      2139: { name: 'BFA- Self-Directed Package', ...BFA_PACKAGE },
+      2140: { name: 'BFA- Supported Package', ...BFA_PACKAGE },
+      2141: { name: 'BFA- Structured Package', ...BFA_PACKAGE },
+    },
+  },
+  store: {
+    label: 'Store',
+    stampKey: 'sf_store_synced',
+    attemptsKey: 'sf_store_sync_attempts',
+    warnUnmapped: true, // warn about store products no profile handles
+    products: {
+      503: { name: 'Emotional Competence 2.0 Assessment (EQ-i)', work: 'Product' },
+      504: { name: 'Moral Intelligence 2.0', work: 'Product' },
+      505: { name: 'Breakthrough Leadership Webinar Series', work: 'Training' },
+      537: { name: 'The Original Values Card Deck', work: 'Product' },
+      538: { name: 'Debrief Only - EQ-i 2.0 Results & Interpretation', work: 'Coaching' },
+      539: { name: 'Financial Intelligence', work: 'Product' },
+      540: { name: 'Transformational Growth Series', work: 'Training' },
+      541: { name: 'Leveraging Your Financial Intelligence', work: 'Product' },
+      542: { name: 'Feeling Word Vocabulary', work: 'Product' },
+      543: { name: 'The Simple Genius (You)', work: 'Product' },
+      544: { name: 'How To Get What You Want and Remain True to Yourself', work: 'Product' },
+      798: { name: 'Building Your Business Around You', work: 'Training' },
+      930: { name: "Don't Wait for Someone Else to Fix It", work: 'Product' },
+      1099: { name: 'Evolve Conference', work: 'Training' },
+      1647: { name: '2024 Evolve Advanced Ticket', work: 'Training' },
+      1797: { name: '5 Levels of Leadership Assessment', work: 'Product' },
+      2049: { name: 'TGS for Women Advisors', work: 'Training' },
+      2268: { name: '2024 Evolve Advanced Ticket - Bulk Pricing', work: 'Training' },
+      2555: { name: 'Leading in Alignment', work: 'Training' },
+      3491: { name: 'Values Platform', work: 'License' },
+      3880: { name: 'Advice That Sticks', work: 'Training' },
+    },
+  },
 };
 
-// Every package above becomes an Asset of this one Salesforce product.
-const SF_PRODUCT_CODE = 'BFA';
-const SF_ASSET_NAME = 'Behavioral Financial Advice';
+// Store products that deliberately are NOT synced by any profile (no warning for these).
+const IGNORED_PRODUCTS = [
+  1548, // Behavioral Financial Advice Program (BFA) - draft
+  1638, // BFA Hybrid Series - draft
+  1639, // Behavioral Financial Advice Accelerator Coaching - draft
+  1985, // BFA | Cohort Series
+  2040, // The Ultimate BFA Experience - draft
+  2539, // BFA & Evolve Ticket Bundle - draft
+  3215, // BFA Pass Protection
+  3824, // BFA Coaching Fee
+];
 
 // Each order also gets one Opportunity with these settings.
 const SF_OPP_STAGE = 'Closed Won';
-const SF_OPP_WORK = 'Product'; // Work being conducted (Work_being_conducted__c)
 const SF_OPP_RECORD_TYPE = 'Team_BFA'; // Record type API name
 
 // Email domains that always go under one Account, whatever company name the buyer typed.
@@ -36,13 +93,26 @@ const DOMAIN_ACCOUNTS = {
   'thrivent.com': 'Thrivent',
 };
 
+const PROFILE_KEY = clean(process.argv[2] || process.env.SYNC_PROFILE || 'bfa').toLowerCase();
+const PROFILE = PROFILES[PROFILE_KEY];
+if (!PROFILE) {
+  console.error(`Unknown sync profile "${PROFILE_KEY}". Use one of: ${Object.keys(PROFILES).join(', ')}`);
+  process.exit(1);
+}
+
+// Product settings for a WooCommerce product ID in this profile.
+function productInfo(productId) {
+  const p = PROFILE.products[productId];
+  return { code: String(productId), asset: '', ...p };
+}
+
 const CONFIG = {
-  productIds: Object.keys(PRODUCT_MAP).map(Number),
+  productIds: Object.keys(PROFILE.products).map(Number),
   statuses: ['processing', 'completed'],
   lookbackDays: Number(process.env.LOOKBACK_DAYS || 3),
   maxAttempts: 3, // after this many failures an order is parked for manual review
-  stampKey: 'sf_asset_created', // order custom field: set when an order has synced
-  attemptsKey: 'sf_sync_attempts', // order custom field: failed attempt count
+  stampKey: PROFILE.stampKey,
+  attemptsKey: PROFILE.attemptsKey,
   cfpMetaKey: clean(process.env.CFP_META_KEY), // blank = auto-detect any meta key containing "cfp"
   sfCfpField: clean(process.env.SF_CFP_FIELD), // Contact API field for CFP ID, e.g. CFP_ID__c
   sfApiVersion: 'v61.0',
@@ -198,7 +268,7 @@ async function query(soql) {
 
 async function sfCreate(obj, data) {
   if (CONFIG.dryRun) {
-    console.log(`   [dry run] would create ${obj}:`, JSON.stringify(data));
+    console.log(`  [dry run] would create ${obj}:`, JSON.stringify(data));
     return `DRYRUN-${obj}`;
   }
   return (await sf(`/sobjects/${obj}`, { method: 'POST', body: JSON.stringify(data) })).id;
@@ -206,7 +276,7 @@ async function sfCreate(obj, data) {
 
 async function sfUpdate(obj, id, data) {
   if (CONFIG.dryRun) {
-    console.log(`   [dry run] would update ${obj} ${id}:`, JSON.stringify(data));
+    console.log(`  [dry run] would update ${obj} ${id}:`, JSON.stringify(data));
     return;
   }
   await sf(`/sobjects/${obj}/${id}`, { method: 'PATCH', body: JSON.stringify(data) });
@@ -219,7 +289,7 @@ function getCfpId(order) {
     ? meta.find((m) => m.key === CONFIG.cfpMetaKey)
     : meta.find((m) => /cfp/i.test(m.key));
   const value = hit ? clean(hit.value) : '';
-  if (hit && !CONFIG.cfpMetaKey) console.log(`   CFP ID auto-detected in meta key "${hit.key}"`);
+  if (hit && !CONFIG.cfpMetaKey) console.log(`  CFP ID auto-detected in meta key "${hit.key}"`);
   return value || null;
 }
 
@@ -294,7 +364,7 @@ const xmlEscape = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').
 async function convertLead(leadId, accountId) {
   const status = await getConvertedStatus();
   if (CONFIG.dryRun) {
-    console.log(`   [dry run] would convert Lead ${leadId}${accountId ? ` into Account ${accountId}` : ''}`);
+    console.log(`  [dry run] would convert Lead ${leadId}${accountId ? ` into Account ${accountId}` : ''}`);
     return { contactId: 'DRYRUN-Contact', accountId: accountId || 'DRYRUN-Account' };
   }
   const body =
@@ -342,13 +412,13 @@ async function upsertContact(person) {
   const matches = await query(
     `SELECT Id, AccountId FROM Contact WHERE Email = '${soqlEscape(person.email)}' ORDER BY CreatedDate ASC LIMIT 5`
   );
-  if (matches.length > 1) console.log(`   Note: ${matches.length} Contacts share ${person.email}; using the oldest`);
+  if (matches.length > 1) console.log(`  Note: ${matches.length} Contacts share ${person.email}; using the oldest`);
   const existing = matches[0] || null;
 
   if (existing) {
     const accountId = await resolveAccount(person, existing);
     await sfUpdate('Contact', existing.Id, existing.AccountId ? fields : { ...fields, AccountId: accountId });
-    console.log(`   Updated existing Contact ${existing.Id}`);
+    console.log(`  Updated existing Contact ${existing.Id}`);
     return { contactId: existing.Id, accountId, how: 'existing Contact' };
   }
 
@@ -358,35 +428,40 @@ async function upsertContact(person) {
     // otherwise Salesforce creates the Account from the Lead's company.
     const targetAccount = person.accountName ? await resolveAccount(person, null) : null;
     const converted = await convertLead(lead.Id, targetAccount);
-    console.log(`   Converted Lead ${lead.Id} to Contact ${converted.contactId}`);
+    console.log(`  Converted Lead ${lead.Id} to Contact ${converted.contactId}`);
     await sfUpdate('Contact', converted.contactId, fields);
     return { ...converted, how: 'converted from Lead' };
   }
 
   const accountId = await resolveAccount(person, null);
   const contactId = await sfCreate('Contact', { ...fields, AccountId: accountId });
-  console.log(`   Created Contact ${contactId}`);
+  console.log(`  Created Contact ${contactId}`);
   return { contactId, accountId, how: 'new Contact' };
 }
 
 const WARNINGS = [];
+function warn(msg) {
+  console.log(`::warning::${msg}`);
+  WARNINGS.push(msg);
+}
 
-// Finds the single Salesforce product (Product Code SF_PRODUCT_CODE) once per run.
+// Finds the Salesforce product for a Product Code, once per code per run.
 // Returns null if it's missing, so Assets are still created and a warning is shown.
-let productLookup = null;
-function findProduct() {
-  if (!productLookup) {
-    productLookup = query(
-      `SELECT Id FROM Product2 WHERE ProductCode = '${soqlEscape(SF_PRODUCT_CODE)}' AND IsActive = true ORDER BY CreatedDate ASC LIMIT 1`
-    ).then((found) => {
-      if (found.length) return found[0].Id;
-      const msg = `No active Salesforce product with Product Code "${SF_PRODUCT_CODE}"; Assets created without a product link`;
-      console.log(`::warning::${msg}`);
-      WARNINGS.push(msg);
-      return null;
-    });
+const productLookups = new Map();
+function findProduct(code) {
+  if (!productLookups.has(code)) {
+    productLookups.set(
+      code,
+      query(
+        `SELECT Id, Name FROM Product2 WHERE ProductCode = '${soqlEscape(code)}' AND IsActive = true ORDER BY CreatedDate ASC LIMIT 1`
+      ).then((found) => {
+        if (found.length) return found[0];
+        warn(`No active Salesforce product with Product Code "${code}"; Assets created without a product link`);
+        return null;
+      })
+    );
   }
-  return productLookup;
+  return productLookups.get(code);
 }
 
 async function createAsset(order, item, contactId, accountId) {
@@ -394,23 +469,24 @@ async function createAsset(order, item, contactId, accountId) {
   const ref = `WC-${order.id}-${item.id}`;
   const dup = await query(`SELECT Id FROM Asset WHERE SerialNumber = '${soqlEscape(ref)}' LIMIT 1`);
   if (dup.length) {
-    console.log(`   Asset already exists for ${ref} (${dup[0].Id})`);
+    console.log(`  Asset already exists for ${ref} (${dup[0].Id})`);
     return dup[0].Id;
   }
-  const product2Id = await findProduct();
+  const info = productInfo(item.product_id);
+  const product = await findProduct(info.code);
   const id = await sfCreate('Asset', {
-    Name: SF_ASSET_NAME,
+    Name: (info.asset || (product && product.Name) || info.name).slice(0, 255),
     AccountId: accountId,
     ContactId: contactId,
-    ...(product2Id ? { Product2Id: product2Id } : {}),
+    ...(product ? { Product2Id: product.Id } : {}),
     SerialNumber: ref,
     Status: 'Purchased',
     PurchaseDate: String(order.date_created).slice(0, 10),
     Quantity: item.quantity,
     Price: Number(item.price) || null,
-    Description: `${PRODUCT_MAP[item.product_id]} (WooCommerce order #${order.number})`,
+    Description: `${info.name} (WooCommerce order #${order.number})`,
   });
-  console.log(`   Created Asset ${id} for "${PRODUCT_MAP[item.product_id]}"`);
+  console.log(`  Created Asset ${id} for "${info.name}"`);
   return id;
 }
 
@@ -422,34 +498,39 @@ function getOppRecordTypeId() {
       `SELECT Id FROM RecordType WHERE SobjectType = 'Opportunity' AND DeveloperName = '${soqlEscape(SF_OPP_RECORD_TYPE)}' AND IsActive = true LIMIT 1`
     ).then((found) => {
       if (found.length) return found[0].Id;
-      const msg = `Opportunity record type "${SF_OPP_RECORD_TYPE}" not found; Opportunities use the default record type`;
-      console.log(`::warning::${msg}`);
-      WARNINGS.push(msg);
+      warn(`Opportunity record type "${SF_OPP_RECORD_TYPE}" not found; Opportunities use the default record type`);
       return null;
     });
   }
   return oppRecordTypeLookup;
 }
 
-// One Opportunity per order: "Shipping company - First Last - Product".
+// One Opportunity per order per profile: "Shipping company - First Last - Product".
 async function createOpportunity(order, person, items, contactId, accountId) {
   const company = clean(order.shipping && order.shipping.company) || person.company;
-  const products = [...new Set(items.map((i) => PRODUCT_MAP[i.product_id]))].join(', ');
+  const productNames = [...new Set(items.map((i) => productInfo(i.product_id).name))];
+  const products = productNames.length > 2 ? 'Multiple products' : productNames.join(', ');
   const name = [company, `${person.firstName} ${person.lastName}`.trim(), products]
     .filter(Boolean)
     .join(' - ')
     .slice(0, 120);
   const closeDate = String(order.date_paid || order.date_created).slice(0, 10);
-  const amount = Number(order.total) || 0;
+  // Amount = this profile's line items only (after discounts, before tax and shipping),
+  // so an order with products from both profiles is never counted twice.
+  const amount = Math.round(items.reduce((sum, i) => sum + (Number(i.total) || 0), 0) * 100) / 100;
+  // Work being conducted is a multi-select picklist: one value per kind of product in the order.
+  const work = [...new Set(items.map((i) => productInfo(i.product_id).work))].sort().join(';');
 
   // Skip if this Opportunity already exists (e.g. a re-run of the same order).
+  // Amount is deliberately not part of this check: orders synced before line-item
+  // amounts were introduced used the order total.
   if (!String(accountId).startsWith('DRYRUN')) {
     const dup = await query(
       `SELECT Id FROM Opportunity WHERE Name = '${soqlEscape(name)}' AND AccountId = '${soqlEscape(accountId)}' ` +
-        `AND CloseDate = ${closeDate} AND Amount = ${amount} LIMIT 1`
+        `AND CloseDate = ${closeDate} LIMIT 1`
     );
     if (dup.length) {
-      console.log(`   Opportunity already exists (${dup[0].Id})`);
+      console.log(`  Opportunity already exists (${dup[0].Id})`);
       return dup[0].Id;
     }
   }
@@ -462,11 +543,11 @@ async function createOpportunity(order, person, items, contactId, accountId) {
     CloseDate: closeDate,
     Amount: amount,
     StageName: SF_OPP_STAGE,
-    Work_being_conducted__c: SF_OPP_WORK,
+    Work_being_conducted__c: work,
     ...(recordTypeId ? { RecordTypeId: recordTypeId } : {}),
     Description: `WooCommerce order #${order.number}`,
   });
-  console.log(`   Created Opportunity ${id}: "${name}"`);
+  console.log(`  Created Opportunity ${id}: "${name}"`);
   return id;
 }
 
@@ -486,7 +567,7 @@ async function processOrder(order) {
 
   const summary = `Contact ${contactId} (${how}); Assets ${assetIds.join(', ')}; Opportunity ${oppId}`;
   await setOrderMeta(order.id, CONFIG.stampKey, `${summary} on ${today()}`);
-  await addOrderNote(order.id, `Synced to Salesforce. ${summary}.`);
+  await addOrderNote(order.id, `${PROFILE.label} sync: synced to Salesforce. ${summary}.`);
   return summary;
 }
 
@@ -498,11 +579,30 @@ async function recordFailure(order, message) {
     await setOrderMeta(order.id, CONFIG.attemptsKey, String(attempts));
     await addOrderNote(
       order.id,
-      `Salesforce sync failed (attempt ${attempts} of ${CONFIG.maxAttempts}): ${message}` +
+      `${PROFILE.label} sync: Salesforce sync failed (attempt ${attempts} of ${CONFIG.maxAttempts}): ${message}` +
         (parked ? ` Automatic retries stopped. Fix the issue, then delete the "${CONFIG.attemptsKey}" custom field to retry.` : '')
     );
   } catch (err) {
-    console.error(`   Could not record failure on the order: ${err.message}`);
+    console.error(`  Could not record failure on the order: ${err.message}`);
+  }
+}
+
+// Store products in recent orders that no profile syncs and that aren't in IGNORED_PRODUCTS.
+function warnUnmappedProducts(orders) {
+  const known = new Set([
+    ...Object.values(PROFILES).flatMap((p) => Object.keys(p.products).map(Number)),
+    ...IGNORED_PRODUCTS,
+  ]);
+  const seen = new Set();
+  for (const o of orders) {
+    for (const li of o.line_items || []) {
+      if (known.has(li.product_id) || seen.has(li.product_id)) continue;
+      seen.add(li.product_id);
+      warn(
+        `Order #${o.number} has product ${li.product_id} "${li.name}", which no sync handles. ` +
+          'Add it to a profile or to IGNORED_PRODUCTS in sync.js.'
+      );
+    }
   }
 }
 
@@ -516,21 +616,22 @@ async function main() {
   WC.url = env('WC_STORE_URL').replace(/\/$/, '');
   WC.auth = 'Basic ' + Buffer.from(`${env('WC_CONSUMER_KEY')}:${env('WC_CONSUMER_SECRET')}`).toString('base64');
 
-  console.log(`BFA → Salesforce sync${CONFIG.dryRun ? ' (DRY RUN: nothing will be written)' : ''}`);
+  console.log(`${PROFILE.label} → Salesforce sync${CONFIG.dryRun ? ' (DRY RUN: nothing will be written)' : ''}`);
   await sfLogin();
 
   const orders = await getRecentOrders();
-  const bfaOrders = orders.filter((o) => o.line_items.some((li) => CONFIG.productIds.includes(li.product_id)));
-  const unsynced = bfaOrders.filter((o) => !metaValue(o, CONFIG.stampKey));
+  if (PROFILE.warnUnmapped) warnUnmappedProducts(orders);
+  const myOrders = orders.filter((o) => o.line_items.some((li) => CONFIG.productIds.includes(li.product_id)));
+  const unsynced = myOrders.filter((o) => !metaValue(o, CONFIG.stampKey));
   const parked = unsynced.filter((o) => (Number(metaValue(o, CONFIG.attemptsKey)) || 0) >= CONFIG.maxAttempts);
   const todo = CONFIG.resyncSynced
-    ? bfaOrders.filter((o) => metaValue(o, CONFIG.stampKey))
+    ? myOrders.filter((o) => metaValue(o, CONFIG.stampKey))
     : unsynced.filter((o) => !parked.includes(o));
   if (CONFIG.resyncSynced) console.log('CATCH-UP MODE: re-running orders that were already synced');
 
   console.log(
-    `Orders in last ${CONFIG.lookbackDays} days: ${orders.length} | BFA: ${bfaOrders.length} | ` +
-      `already synced: ${bfaOrders.length - unsynced.length} | parked: ${parked.length} | to process: ${todo.length}`
+    `Orders in last ${CONFIG.lookbackDays} days: ${orders.length} | ${PROFILE.label}: ${myOrders.length} | ` +
+      `already synced: ${myOrders.length - unsynced.length} | parked: ${parked.length} | to process: ${todo.length}`
   );
 
   const successes = [];
@@ -540,20 +641,20 @@ async function main() {
     try {
       successes.push(`#${order.number}: ${await processOrder(order)}`);
     } catch (err) {
-      console.error(`   FAILED: ${err.message}`);
+      console.error(`  FAILED: ${err.message}`);
       failures.push(`#${order.number}: ${err.message}`);
       await recordFailure(order, err.message);
     }
   }
 
   for (const o of parked) {
-    console.log(`::warning::Order #${o.number} needs manual attention (sync failed ${CONFIG.maxAttempts} times)`);
+    console.log(`::warning::Order #${o.number} needs manual attention (${PROFILE.label} sync failed ${CONFIG.maxAttempts} times)`);
   }
 
   console.log(`\nDone. Synced ${successes.length}, failed ${failures.length}, parked ${parked.length}.`);
 
   writeJobSummary([
-    `## BFA → Salesforce sync${CONFIG.dryRun ? ' (dry run)' : ''}`,
+    `## ${PROFILE.label} → Salesforce sync${CONFIG.dryRun ? ' (dry run)' : ''}`,
     `Checked ${orders.length} orders from the last ${CONFIG.lookbackDays} days. ` +
       `Synced **${successes.length}**, failed **${failures.length}**, parked **${parked.length}**.`,
     ...(successes.length ? ['', '### Synced', ...successes.map((s) => `- ${s}`)] : []),
@@ -567,6 +668,6 @@ async function main() {
 
 main().catch((err) => {
   console.error(err.message || err);
-  writeJobSummary(['## BFA → Salesforce sync', '', `**Run failed:** ${err.message || err}`]);
+  writeJobSummary([`## ${PROFILE.label} → Salesforce sync`, '', `**Run failed:** ${err.message || err}`]);
   process.exit(1);
 });
