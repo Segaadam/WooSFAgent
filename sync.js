@@ -29,6 +29,11 @@ const SF_OPP_STAGE = 'Closed Won';
 const SF_OPP_WORK = 'Product'; // Work being conducted (Work_being_conducted__c)
 const SF_OPP_RECORD_TYPE = 'Team_BFA'; // Record type API name
 
+// Email domains that always go under one Account, whatever company name the buyer typed.
+const DOMAIN_ACCOUNTS = {
+  'ampf.com': 'Ameriprise Financial',
+};
+
 const CONFIG = {
   productIds: Object.keys(PRODUCT_MAP).map(Number),
   statuses: ['processing', 'completed'],
@@ -223,6 +228,8 @@ function getPerson(order) {
     lastName: clean(b.last_name),
     email: clean(b.email).toLowerCase(),
     company: clean(b.company),
+    // Account to file them under: a DOMAIN_ACCOUNTS match wins over the typed company name.
+    accountName: DOMAIN_ACCOUNTS[clean(b.email).toLowerCase().split('@')[1]] || clean(b.company),
     street: [clean(b.address_1), clean(b.address_2)].filter(Boolean).join('\n'),
     city: clean(b.city),
     state: clean(b.state),
@@ -237,16 +244,16 @@ async function resolveAccount(person, existingContact) {
   // Existing Contacts keep their current Account.
   if (existingContact && existingContact.AccountId) return existingContact.AccountId;
 
-  if (person.company) {
+  if (person.accountName) {
     // If several Accounts share the name, use the oldest one.
     const found = await query(
-      `SELECT Id FROM Account WHERE Name = '${soqlEscape(person.company)}' ORDER BY CreatedDate ASC LIMIT 1`
+      `SELECT Id FROM Account WHERE Name = '${soqlEscape(person.accountName)}' ORDER BY CreatedDate ASC LIMIT 1`
     );
     if (found.length) return found[0].Id;
   }
 
   // No company (or company not found): create a new Account.
-  const name = person.company || `${person.firstName} ${person.lastName}`.trim();
+  const name = person.accountName || `${person.firstName} ${person.lastName}`.trim();
   return sfCreate(
     'Account',
     compact({
@@ -347,7 +354,7 @@ async function upsertContact(person) {
   if (lead) {
     // With a company on the order, convert into the matching (oldest) Account;
     // otherwise Salesforce creates the Account from the Lead's company.
-    const targetAccount = person.company ? await resolveAccount(person, null) : null;
+    const targetAccount = person.accountName ? await resolveAccount(person, null) : null;
     const converted = await convertLead(lead.Id, targetAccount);
     console.log(`   Converted Lead ${lead.Id} to Contact ${converted.contactId}`);
     await sfUpdate('Contact', converted.contactId, fields);
