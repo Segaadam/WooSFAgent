@@ -551,6 +551,24 @@ async function createOpportunity(order, person, items, contactId, accountId) {
   return id;
 }
 
+// Adds the buyer as the Opportunity's primary Contact Role, unless they already are one
+// (so re-runs and catch-up mode also fill it in on existing Opportunities).
+async function ensureContactRole(oppId, contactId) {
+  if (!String(oppId).startsWith('DRYRUN') && !String(contactId).startsWith('DRYRUN')) {
+    const existing = await query(
+      `SELECT Id FROM OpportunityContactRole WHERE OpportunityId = '${soqlEscape(oppId)}' ` +
+        `AND ContactId = '${soqlEscape(contactId)}' LIMIT 1`
+    );
+    if (existing.length) {
+      console.log(`  Contact Role already exists (${existing[0].Id})`);
+      return existing[0].Id;
+    }
+  }
+  const id = await sfCreate('OpportunityContactRole', { OpportunityId: oppId, ContactId: contactId, IsPrimary: true });
+  console.log(`  Added Contact Role ${id}`);
+  return id;
+}
+
 // ---------- per-order flow ----------
 async function processOrder(order) {
   const person = getPerson(order);
@@ -564,6 +582,7 @@ async function processOrder(order) {
   for (const item of items) assetIds.push(await createAsset(order, item, contactId, accountId));
 
   const oppId = await createOpportunity(order, person, items, contactId, accountId);
+  await ensureContactRole(oppId, contactId);
 
   const summary = `Contact ${contactId} (${how}); Assets ${assetIds.join(', ')}; Opportunity ${oppId}`;
   await setOrderMeta(order.id, CONFIG.stampKey, `${summary} on ${today()}`);
