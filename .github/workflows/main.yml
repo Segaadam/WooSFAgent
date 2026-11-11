@@ -1,8 +1,13 @@
 name: WooCommerce → Salesforce sync
 
 on:
+  # Backup timer. GitHub often delays or skips these, so it is only a safety net.
   schedule:
     - cron: '7 * * * *'
+  # Main trigger: the order relay (relay/ folder, hosted on Vercel) sends this
+  # as soon as a paid WooCommerce order comes in.
+  repository_dispatch:
+    types: [woo-order]
   workflow_dispatch:
     inputs:
       sync:
