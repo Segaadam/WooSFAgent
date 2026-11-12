@@ -1,23 +1,31 @@
-// Order relay: receives WooCommerce "Order updated" webhooks and starts the
-// WooCommerce → Salesforce sync on GitHub Actions right away.
+// Order relay: receives WooCommerce "Order updated" webhooks and starts, right away on GitHub Actions:
+//   1. the WooCommerce → Salesforce sync (Segaadam/WooSFAgent), and
+//   2. the BFA → Knowledge Link enrollment (Segaadam/BFA-LMS-Enroll), for orders containing a BFA package.
 // Hosted on Vercel (Root Directory: relay). No npm dependencies.
 //
 // Environment variables (Vercel → Project → Settings → Environment Variables):
-//   WC_WEBHOOK_SECRET  the Secret typed into the WooCommerce webhook
-//   GITHUB_TOKEN       fine-grained token for Segaadam/WooSFAgent, Contents: Read and write
+// WC_WEBHOOK_SECRET the Secret typed into the WooCommerce webhook
+// GITHUB_TOKEN fine-grained token with Contents: Read and write on
+//              Segaadam/WooSFAgent AND Segaadam/BFA-LMS-Enroll
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
-const REPO = 'Segaadam/WooSFAgent';
-const EVENT_TYPE = 'woo-order'; // must match repository_dispatch types in main.yml
+const EVENT_TYPE = 'woo-order'; // must match repository_dispatch types in each repo's workflow
 
-// Only paid orders are synced.
+// Only paid orders are handled.
 const PAID_STATUSES = ['processing', 'completed'];
 
-// Order fields the sync itself writes. If an order already has one, it has been
-// synced (or has failed and will be retried by the hourly backup run), so the
-// update that the sync's own write causes does not start yet another run.
-const SYNC_KEYS = ['sf_asset_created', 'sf_store_synced', 'sf_sync_attempts', 'sf_store_sync_attempts'];
+// 1. Salesforce sync. Order fields the sync itself writes. If an order already has one, it has been
+// synced (or has failed and will be retried by the backup run), so the update that the sync's own
+// write causes does not start yet another run.
+const SF_REPO = 'Segaadam/WooSFAgent';
+const SF_KEYS = ['sf_asset_created', 'sf_store_synced', 'sf_sync_attempts', 'sf_store_sync_attempts'];
+
+// 2. Knowledge Link enrollment: only orders with a BFA package, and only until the enrollment
+// agent has stamped the order.
+const LMS_REPO = 'Segaadam/BFA-LMS-Enroll';
+const LMS_KEY = 'bfa_lms_enrolled';
+const BFA_PRODUCT_IDS = [2139, 2140, 2141];
 
 const reply = (status, message) => new Response(message, { status, headers: { 'Content-Type': 'text/plain' } });
 
@@ -27,6 +35,27 @@ function validSignature(rawBody, signature, secret) {
   const a = Buffer.from(expected);
   const b = Buffer.from(String(signature));
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+async function dispatch(repo, orderId) {
+  const res = await fetch(`https://api.github.com/repos/${repo}/dispatches`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'woo-order-relay',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ event_type: EVENT_TYPE, client_payload: { order: orderId } }),
+  });
+  if (res.status === 204) {
+    console.log(`Started ${repo} for order ${orderId}`);
+    return `${repo}: started`;
+  }
+  const text = (await res.text()).slice(0, 300);
+  console.error(`GitHub dispatch to ${repo} failed for order ${orderId}: ${res.status} ${text}`);
+  throw new Error(`${repo}: dispatch failed (${res.status})`);
 }
 
 export async function POST(request) {
@@ -46,29 +75,23 @@ export async function POST(request) {
     return reply(400, 'invalid JSON');
   }
 
-  const keys = new Set((order.meta_data || []).map((m) => m.key));
   if (!PAID_STATUSES.includes(order.status)) return reply(200, `skipped: status ${order.status}`);
-  if (SYNC_KEYS.some((k) => keys.has(k))) return reply(200, 'skipped: already handled by the sync');
 
-  const res = await fetch(`https://api.github.com/repos/${REPO}/dispatches`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent': 'woo-order-relay',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ event_type: EVENT_TYPE, client_payload: { order: order.id } }),
-  });
+  const keys = new Set((order.meta_data || []).map((m) => m.key));
+  const hasBfa = (order.line_items || []).some((li) => BFA_PRODUCT_IDS.includes(Number(li.product_id)));
 
-  if (res.status !== 204) {
-    const text = (await res.text()).slice(0, 300);
-    console.error(`GitHub dispatch failed for order ${order.id}: ${res.status} ${text}`);
-    return reply(502, `GitHub dispatch failed: ${res.status}`);
-  }
-  console.log(`Started sync for order ${order.id}`);
-  return reply(200, `sync started for order ${order.id}`);
+  const jobs = [];
+  if (!SF_KEYS.some((k) => keys.has(k))) jobs.push(dispatch(SF_REPO, order.id));
+  if (hasBfa && !keys.has(LMS_KEY)) jobs.push(dispatch(LMS_REPO, order.id));
+  if (!jobs.length) return reply(200, 'skipped: already handled');
+
+  // Run both; one failing does not stop the other. Only a failed Salesforce start is reported to
+  // WooCommerce as an error: WooCommerce disables a webhook after repeated errors, and a missed
+  // Knowledge Link start is picked up by that agent's own scheduled run anyway.
+  const results = await Promise.allSettled(jobs);
+  const lines = results.map((r) => (r.status === 'fulfilled' ? r.value : r.reason.message));
+  const sfFailed = results.some((r) => r.status === 'rejected' && r.reason.message.startsWith(SF_REPO));
+  return reply(sfFailed ? 502 : 200, `order ${order.id}: ${lines.join('; ')}`);
 }
 
 // A browser visit to the URL just confirms the relay is up.
