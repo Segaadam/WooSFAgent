@@ -86,6 +86,11 @@ const IGNORED_PRODUCTS = [
 const SF_OPP_STAGE = 'Closed Won';
 const SF_OPP_RECORD_TYPE = 'Team_BFA'; // Record type API name
 
+// When an open Lead is converted but its owner is an inactive user or a queue,
+// Salesforce refuses the conversion. The new Contact (and Account) go to this
+// active user instead. Leads owned by active users keep their owner.
+const SF_FALLBACK_OWNER_NAME = 'Adam Segal';
+
 // Email domains that always go under one Account, whatever company name the buyer typed.
 const DOMAIN_ACCOUNTS = {
   'ampf.com': 'Ameriprise Financial',
@@ -342,9 +347,34 @@ async function resolveAccount(person, existingContact) {
 // ---------- Lead conversion ----------
 async function findOpenLead(email) {
   const leads = await query(
-    `SELECT Id FROM Lead WHERE Email = '${soqlEscape(email)}' AND IsConverted = false ORDER BY CreatedDate ASC LIMIT 1`
+    `SELECT Id, OwnerId, Owner.Name, Owner.Type, Owner.IsActive FROM Lead ` +
+      `WHERE Email = '${soqlEscape(email)}' AND IsConverted = false ORDER BY CreatedDate ASC LIMIT 1`
   );
   return leads[0] || null;
+}
+
+// The active user who takes over converted Leads whose owner can't (see SF_FALLBACK_OWNER_NAME).
+let fallbackOwnerLookup = null;
+function getFallbackOwnerId() {
+  if (!fallbackOwnerLookup) {
+    fallbackOwnerLookup = query(
+      `SELECT Id FROM User WHERE Name = '${soqlEscape(SF_FALLBACK_OWNER_NAME)}' AND IsActive = true ORDER BY CreatedDate ASC LIMIT 1`
+    ).then((found) => {
+      if (!found.length) throw new Error(`No active Salesforce user named "${SF_FALLBACK_OWNER_NAME}" to take over the Lead`);
+      return found[0].Id;
+    });
+  }
+  return fallbackOwnerLookup;
+}
+
+// Returns the owner to give the converted records, or null to keep the Lead's own owner.
+async function conversionOwner(lead) {
+  const owner = lead.Owner || {};
+  if (owner.Type === 'User' && owner.IsActive) return null;
+  const ownerId = await getFallbackOwnerId();
+  const why = owner.Type && owner.Type !== 'User' ? `owned by a ${owner.Type.toLowerCase()}` : 'its owner is inactive';
+  console.log(`  Lead ${lead.Id} ${why} (${owner.Name || lead.OwnerId}); converting to ${SF_FALLBACK_OWNER_NAME}`);
+  return ownerId;
 }
 
 let convertedStatus = null;
@@ -361,10 +391,13 @@ const xmlEscape = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').
 
 // Converts a Lead into a Contact (and Account) with no Opportunity.
 // Salesforce only offers lead conversion through its SOAP API, so this call uses SOAP.
-async function convertLead(leadId, accountId) {
+async function convertLead(leadId, accountId, ownerId) {
   const status = await getConvertedStatus();
   if (CONFIG.dryRun) {
-    console.log(`  [dry run] would convert Lead ${leadId}${accountId ? ` into Account ${accountId}` : ''}`);
+    console.log(
+      `  [dry run] would convert Lead ${leadId}${accountId ? ` into Account ${accountId}` : ''}` +
+        (ownerId ? ` with owner ${ownerId}` : '')
+    );
     return { contactId: 'DRYRUN-Contact', accountId: accountId || 'DRYRUN-Account' };
   }
   const body =
@@ -377,6 +410,7 @@ async function convertLead(leadId, accountId) {
     '<urn:doNotCreateOpportunity>true</urn:doNotCreateOpportunity>' +
     `<urn:leadId>${leadId}</urn:leadId>` +
     '<urn:overwriteLeadSource>false</urn:overwriteLeadSource>' +
+    (ownerId ? `<urn:ownerId>${ownerId}</urn:ownerId>` : '') +
     '<urn:sendNotificationEmail>false</urn:sendNotificationEmail>' +
     '</urn:leadConverts></urn:convertLead></soapenv:Body></soapenv:Envelope>';
   const res = await request('Salesforce convertLead', SF.soapUrl, {
@@ -427,7 +461,8 @@ async function upsertContact(person) {
     // With a company on the order, convert into the matching (oldest) Account;
     // otherwise Salesforce creates the Account from the Lead's company.
     const targetAccount = person.accountName ? await resolveAccount(person, null) : null;
-    const converted = await convertLead(lead.Id, targetAccount);
+    const ownerId = await conversionOwner(lead);
+    const converted = await convertLead(lead.Id, targetAccount, ownerId);
     console.log(`  Converted Lead ${lead.Id} to Contact ${converted.contactId}`);
     await sfUpdate('Contact', converted.contactId, fields);
     return { ...converted, how: 'converted from Lead' };
